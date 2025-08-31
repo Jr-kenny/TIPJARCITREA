@@ -1503,64 +1503,50 @@
                 const recipientDescriptions = JSON.parse(localStorage.getItem(`recipientDescriptions_${userAddress.toLowerCase()}`) || '{}');
 
                 try {
-                    const tipSentFilter = tipJarContract.filters.TipSent();
-                    const sentLogs = await provider.getLogs({
-                        address: tipJarContract.address,
-                        topics: tipSentFilter.topics,
-                        fromBlock: 0
-                    });
+                    // More efficient event fetching using indexed parameters
+                    const sentFilter = tipJarContract.filters.TipSent(userAddress, null, null);
+                    const receivedFilter = tipJarContract.filters.TipSent(null, userAddress, null);
+                    const withdrawnFilter = tipJarContract.filters.TipsWithdrawn(userAddress, null, null);
+
+                    const sentLogsPromise = provider.getLogs({ ...sentFilter, fromBlock: 0 });
+                    const receivedLogsPromise = provider.getLogs({ ...receivedFilter, fromBlock: 0 });
+                    const withdrawnLogsPromise = provider.getLogs({ ...withdrawnFilter, fromBlock: 0 });
+
+                    const [sentLogs, receivedLogs, withdrawnLogs] = await Promise.all([sentLogsPromise, receivedLogsPromise, withdrawnLogsPromise]);
                     
-                    for (const log of sentLogs) {
-                        const parsedLog = tipJarContract.interface.parseLog(log);
-                        const block = await provider.getBlock(log.blockNumber);
-                        
-                        if (parsedLog.args.recipient.toLowerCase() === userAddress.toLowerCase() ||
-                            parsedLog.args.tipper.toLowerCase() === userAddress.toLowerCase()) {
-                            
-                            let tokenSymbol = 'cBTC';
-                            if (parsedLog.args.token !== "0x0000000000000000000000000000000000000000") {
-                                try {
-                                    const tokenContract = new ethers.Contract(parsedLog.args.token, ERC20_ABI, provider);
-                                    tokenSymbol = await tokenContract.symbol();
-                                } catch (error) {
-                                    tokenSymbol = 'Unknown';
-                                }
-                            }
+                    // Combine logs and remove duplicates (e.g. sending to self)
+                    const combinedLogs = [...sentLogs, ...receivedLogs, ...withdrawnLogs];
+                    const uniqueLogs = combinedLogs.filter((log, index, self) =>
+                        index === self.findIndex((l) => (
+                            l.transactionHash === log.transactionHash && l.logIndex === log.logIndex
+                        ))
+                    );
 
-                            const type = parsedLog.args.recipient.toLowerCase() === userAddress.toLowerCase() ? 'Received' : 'Sent';
-                            
-                            // Get description - prioritize recipient descriptions for received tips
-                            let description = '';
-                            if (type === 'Received') {
-                                description = recipientDescriptions[log.transactionHash] || descriptions[log.transactionHash] || '';
-                            } else {
-                                description = descriptions[log.transactionHash] || '';
-                            }
-
-                            allEvents.push({
-                                from: parsedLog.args.tipper,
-                                to: parsedLog.args.recipient,
-                                token: tokenSymbol,
-                                amount: ethers.utils.formatEther(parsedLog.args.amount),
-                                timestamp: block.timestamp,
-                                txHash: log.transactionHash,
-                                description: description,
-                                type,
-                                blockNumber: log.blockNumber
-                            });
-                        }
+                    if (uniqueLogs.length === 0) {
+                        allHistoryStatus.textContent = "No transactions found.";
+                        return;
                     }
 
-                    const withdrawnFilter = tipJarContract.filters.TipsWithdrawn(userAddress, null, null);
-                    const withdrawnLogs = await provider.getLogs({
-                        address: tipJarContract.address,
-                        topics: withdrawnFilter.topics,
-                        fromBlock: 0
-                    });
+                    // Efficiently fetch block timestamps to avoid one RPC call per log
+                    const uniqueBlockNumbers = [...new Set(uniqueLogs.map(log => log.blockNumber))];
+                    const blockPromises = uniqueBlockNumbers.map(blockNumber => provider.getBlock(blockNumber));
+                    const blocks = await Promise.all(blockPromises);
+                    const blockTimestampMap = blocks.reduce((acc, block) => {
+                        acc[block.number] = block.timestamp;
+                        return acc;
+                    }, {});
 
-                    for (const log of withdrawnLogs) {
+                    // Process logs with timestamps now available locally
+                    for (const log of uniqueLogs) {
                         const parsedLog = tipJarContract.interface.parseLog(log);
-                        const block = await provider.getBlock(log.blockNumber);
+                        const timestamp = blockTimestampMap[log.blockNumber];
+                        
+                        let eventData = {
+                            timestamp: timestamp,
+                            txHash: log.transactionHash,
+                            blockNumber: log.blockNumber,
+                            amount: ethers.utils.formatEther(parsedLog.args.amount)
+                        };
                         
                         let tokenSymbol = 'cBTC';
                         if (parsedLog.args.token !== "0x0000000000000000000000000000000000000000") {
@@ -1571,18 +1557,28 @@
                                 tokenSymbol = 'Unknown';
                             }
                         }
+                        eventData.token = tokenSymbol;
 
-                        allEvents.push({
-                            from: userAddress,
-                            to: 'Withdrawn',
-                            token: tokenSymbol,
-                            amount: ethers.utils.formatEther(parsedLog.args.amount),
-                            timestamp: block.timestamp,
-                            txHash: log.transactionHash,
-                            description: '',
-                            type: 'Withdrawn',
-                            blockNumber: log.blockNumber
-                        });
+                        if (parsedLog.name === "TipSent") {
+                            eventData.from = parsedLog.args.tipper;
+                            eventData.to = parsedLog.args.recipient;
+                            eventData.type = parsedLog.args.recipient.toLowerCase() === userAddress.toLowerCase() ? 'Received' : 'Sent';
+                            
+                            let description = '';
+                            if (eventData.type === 'Received') {
+                                description = recipientDescriptions[log.transactionHash] || descriptions[log.transactionHash] || '';
+                            } else {
+                                description = descriptions[log.transactionHash] || '';
+                            }
+                            eventData.description = description;
+
+                        } else if (parsedLog.name === "TipsWithdrawn") {
+                            eventData.from = userAddress;
+                            eventData.to = 'Withdrawn';
+                            eventData.type = 'Withdrawn';
+                            eventData.description = '';
+                        }
+                        allEvents.push(eventData);
                     }
                     
                     if (allEvents.length === 0) {
@@ -1753,9 +1749,11 @@
                     await tx.wait();
                     dashboardStatusDiv.textContent = "Native tokens withdrawn successfully!";
                     
-                    // Refresh balances after withdrawal
+                    // Refresh balances immediately after withdrawal
+                    fetchDataAndHistory();
+                    
+                    // Clear the status message after 2 seconds
                     setTimeout(() => {
-                        fetchDataAndHistory();
                         dashboardStatusDiv.textContent = '';
                     }, 2000);
                 } catch (error) {
@@ -1792,10 +1790,15 @@
                 });
 
                 window.ethereum.on('chainChanged', (chainId) => {
-                    window.location.reload();
+                    // Instead of reloading, re-check the wallet connection and update data
+                    if(initializeContract()) {
+                        checkIfWalletIsConnected();
+                    }
                 });
             }
         });
     </script>
 </body>
 </html>
+
+
